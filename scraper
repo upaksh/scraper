@@ -1,0 +1,115 @@
+use strict;
+use warnings;
+use LWP::UserAgent;
+use HTTP::Request;
+use Web::Scraper;
+use JSON;
+use Data::Dumper;
+
+# url to process
+my $url = "https://content.wetu.com/Africa";
+my $ua = LWP::UserAgent->new(
+    ssl_opts => { verify_hostname => 0 },
+    protocols_allowed => ['https'],
+);
+my $req = HTTP::Request->new( GET => $url);
+my $response = $ua->request($req);
+
+# save the output json to file
+open (FILE, ">test.txt");
+
+# scraper format
+my $sitedata = scraper {
+    process 'table#brochures tr', 'propertyData[]' => sub {
+        my $elem = shift;
+        my $data_id = $elem->{'data-id'};
+        my @data = ();
+        if($data_id){
+            for my $node ($elem->findnodes( ".//td" )) {
+                if($node->findnodes(".//a")){
+                    foreach my $href ($node->findnodes(".//a")){
+                        #push @data, { $href->as_text => $href->{href} };
+                        push @data, $href->{href};
+                    }
+                }
+                else{
+                    #push @data, { $node->as_text => 1 };
+                    push @data, $node->as_text;
+                }
+            }
+            
+            return { $data_id => \@data };
+        }
+        else{
+            return {};
+        }
+    };
+};
+
+# scrap the url
+my $res = $sitedata->scrape( $response->content );
+
+my $master_property_data = {};
+# iterate the array 'propertyData'
+for my $property ( @{ $res->{propertyData} } ) {
+    foreach my $property_id ( keys %{ $property } ){
+        my $attributes = $property->{$property_id};
+        push @{ $master_property_data->{$property_id} }, { 'property'           => $attributes->[0] };
+        push @{ $master_property_data->{$property_id} }, { 'destination'        => $attributes->[1] };
+        push @{ $master_property_data->{$property_id} }, { 'country'            => $attributes->[2] };
+
+        # get description, room types, propery type, facilities for each property by scraping individual links
+        my $rooms = get_rooms( $property_id );
+
+        push @{ $master_property_data->{$property_id} }, { 'description'        => $rooms->{'description'} };
+        push @{ $master_property_data->{$property_id} }, { 'room_types'         => $rooms->{'room_types'} };
+        push @{ $master_property_data->{$property_id} }, { 'languages'          => $rooms->{'languages'} };
+        push @{ $master_property_data->{$property_id} }, { 'property_type'      => $rooms->{'property_type'} };
+        push @{ $master_property_data->{$property_id} }, { 'number_of_rooms'    => $rooms->{'number_of_rooms'} };
+        push @{ $master_property_data->{$property_id} }, { 'facilities'         => $rooms->{'facilities'} };
+    }
+}
+
+# convert the data to json and dump to file
+my $json_data = encode_json $master_property_data;
+print FILE $json_data;
+close(FILE);
+
+sub get_rooms {
+    my $property_id = shift;
+    my $url = "https://wetu.com/Embed/Mini/index/$property_id?op=&desc=1#rooms";#print $url;
+    my $req = HTTP::Request->new( GET => $url);
+    my $response = $ua->request($req);#print Dumper($response);
+
+    my $rooms_data = scraper {
+        process "div.room-select > select > option", 'roomtypes[]' => 'TEXT';
+        process "div#description p", 'description[]' => 'TEXT';
+
+        process "div.fact", "facilities[]" => scraper {
+            process "div.fact-title", "title" => 'TEXT';
+            process "div.fact-column-wrapper > div.fact-column", "title_attributes[]" => 'TEXT'; 
+        };
+
+        process "div.fact-column-wrapper-stats", "facilities_stats[]" => scraper {
+            process "div.fact-column sm", "title" => 'TEXT';
+            process "div.fact-column", "title_attributes[]" => 'TEXT'; 
+        };
+    };
+
+    my $res = $rooms_data->scrape( $response->content );
+    my $room_data = {};
+
+    $room_data->{'description'}     = $res->{'description'}[1];
+    $room_data->{'room_types'}      = $res->{'roomtypes'};
+    $room_data->{'languages'}       = $res->{'facilities_stats'}->[0]->{'title_attributes'}->[1];
+    $room_data->{'property_type'}   = $res->{'facilities_stats'}->[0]->{'title_attributes'}->[3];
+    $room_data->{'number_of_rooms'} = $res->{'facilities_stats'}->[0]->{'title_attributes'}->[5];
+
+    foreach my $facility ( @{ $res->{'facilities'} } ){
+        if( $facility->{ 'title' } ){
+            push @{ $room_data->{'facilities'} } , { lc( $facility->{ 'title' } ) => $facility->{ 'title_attributes' } };
+        }
+    }
+    
+    return $room_data;
+}
